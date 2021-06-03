@@ -61,7 +61,7 @@ def printDot(op_code, cur_count, max_count=None, message=''):
         print('.', end='')
 
 class BaseRelease:
-    def __init__(self, mGit, version, commit='HEAD', git_ssh=False, git_org='FreeRTOS', repo_path=None):
+    def __init__(self, mGit, version, commit='HEAD', git_ssh=False, git_org='FreeRTOS', repo_path=None, branch='main'):
         self.version = version
         self.tag_msg = 'Autocreated by FreeRTOS Git Tools.'
         self.commit = commit
@@ -69,6 +69,7 @@ class BaseRelease:
         self.git_org = git_org
         self.repo_path = repo_path
         self.local_repo = None
+        self.branch = branch
         self.commit_msg_prefix = '[AUTO][RELEASE]: '
         self.description = ''
         self.mGit = mGit # Save a handle to the authed git session
@@ -199,7 +200,7 @@ class BaseRelease:
         return False
 
     def restorePriorToRelease(self):
-        info('Restoring "master" to just before autorelease:%s' % self.version)
+        info('Restoring "main" to just before autorelease:%s' % self.version)
 
         self.deleteGitRelease()
         self.rollbackAutoCommits()
@@ -208,12 +209,13 @@ class BaseRelease:
 
 
 class KernelRelease(BaseRelease):
-    def __init__(self, mGit, version, commit='HEAD', git_ssh=False, git_org='FreeRTOS', repo_path=None):
-        super().__init__(mGit, version, commit=commit, git_ssh=git_ssh, git_org=git_org, repo_path=repo_path)
+    def __init__(self, mGit, version, commit='HEAD', git_ssh=False, git_org='FreeRTOS', repo_path=None, branch='main', main_br_version=''):
+        super().__init__(mGit, version, commit=commit, git_ssh=git_ssh, git_org=git_org, repo_path=repo_path, branch=branch)
 
         self.repo_name = '%s/FreeRTOS-Kernel' % self.git_org
         self.repo = mGit.get_repo(self.repo_name)
         self.tag = 'V%s' % version
+        self.main_br_version = main_br_version
 
         # Parent ctor configures local_repo if caller chooses to source local repo from repo_path.
         if self.repo_path is None:
@@ -224,21 +226,21 @@ class KernelRelease(BaseRelease):
             # Clone the target repo for creating the release autocommits
             remote_name = self.getRemoteEndpoint(self.repo_name)
             info('Downloading %s@%s to baseline auto-commits...' % (remote_name, commit), end='')
-            self.local_repo = Repo.clone_from(remote_name, self.repo_path, progress=printDot)
+            self.local_repo = Repo.clone_from(remote_name, self.repo_path, progress=printDot, branch=self.branch)
 
         # In case user gave non-HEAD commit to baseline
         self.local_repo.git.checkout(commit)
 
         print()
 
+    def updateVersionMacros(self, version_str):
+        info('Updating version macros in task.h for "%s"' % version_str)
 
-    def updateVersionMacros(self):
-        info('Updating version macros in task.h for "%s"' % self.version)
+        # Strip out any non-numeric or '.' characters before setting major / minor / build
+        (major, minor, build) = re.sub("[^0-9.]", "", version_str).split('.')
+        update_freertos_version_macros(os.path.join(self.repo_path, 'include', 'task.h'), version_str, major, minor, build)
 
-        (major, minor, build) = self.version.split('.')
-        update_freertos_version_macros(os.path.join(self.repo_path, 'include', 'task.h'), major, minor, build)
-
-        self.commitChanges(self.commit_msg_prefix + 'Bump task.h version macros to "%s"' % self.version)
+        self.commitChanges(self.commit_msg_prefix + 'Bump task.h version macros to "%s"' % version_str)
 
     def createGitRelease(self):
         '''
@@ -263,16 +265,33 @@ class KernelRelease(BaseRelease):
     def autoRelease(self):
         info('Auto-releasing FreeRTOS Kernel V%s' % self.version)
 
-        self.updateFileHeaderVersions(['FreeRTOS Kernel V'], 'FreeRTOS Kernel V%s' % self.version)
-        self.updateVersionMacros()
+        # Determine if we need to set a separate version macros for the main branch
+        if (self.commit == 'HEAD') and len(self.main_br_version) > 0 and (self.main_br_version != self.version):
+            # Update version macros for main branch
+            self.updateVersionMacros(self.main_br_version)
 
-        # When baselining off a non-HEAD commit, master is left unchanged by tagging a detached HEAD,
-        # applying the autocommits, tagging, and pushing the new tag data to remote.
-        # However in the detached HEAD state we don't have a branch to push to, so we skip
-        if self.commit == 'HEAD':
+            # Push the branch
             self.pushLocalCommits()
 
+            # Revert the last commit in our working git repo
+            self.local_repo.git.reset('--hard','HEAD^')
+
+        # Update the version macros
+        self.updateVersionMacros(self.version)
+
+        if (self.commit == 'HEAD') and (self.main_br_version == self.version):
+            # Share a task.h version number commit for main branch and release tag)
+            self.pushLocalCommits()
+
+        # When baselining off a non-HEAD commit, main is left unchanged by tagging a detached HEAD,
+        # applying the autocommits, tagging, and pushing the new tag data to remote.
+        # However in the detached HEAD state we don't have a branch to push to, so we skip
+
+        # Update the header in each c/assembly file
+        self.updateFileHeaderVersions(['FreeRTOS Kernel V','FreeRTOS Kernel <DEVELOPMENT BRANCH>'], 'FreeRTOS Kernel V%s' % self.version)
+
         self.pushTag()
+
         self.createGitRelease()
 
         info('Kernel release done.')
@@ -280,8 +299,8 @@ class KernelRelease(BaseRelease):
 
 
 class FreertosRelease(BaseRelease):
-    def __init__(self, mGit, version, commit, git_ssh=False, git_org='FreeRTOS', repo_path=None):
-        super().__init__(mGit, version, commit, git_ssh=git_ssh, git_org=git_org, repo_path=repo_path)
+    def __init__(self, mGit, version, commit, git_ssh=False, git_org='FreeRTOS', repo_path=None, branch='main'):
+        super().__init__(mGit, version, commit, git_ssh=git_ssh, git_org=git_org, repo_path=repo_path, branch=branch)
 
         self.repo_name = '%s/FreeRTOS' % self.git_org
         self.repo = mGit.get_repo(self.repo_name)
@@ -300,7 +319,7 @@ class FreertosRelease(BaseRelease):
             # Clone the target repo for creating the release autocommits
             remote_name = self.getRemoteEndpoint(self.repo_name)
             info('Downloading %s@%s to baseline auto-commits...' % (remote_name, commit), end='')
-            self.local_repo = Repo.clone_from(remote_name, self.repo_path, progress=printDot)
+            self.local_repo = Repo.clone_from(remote_name, self.repo_path, progress=printDot, branch=self.branch)
 
         # In support of non-HEAD baselines
         self.local_repo.git.checkout(commit)
@@ -361,7 +380,8 @@ class FreertosRelease(BaseRelease):
         packaged_repo = Repo.clone_from(self.getRemoteEndpoint(self.repo_name),
                                         rel_repo_path,
                                         multi_options=['--depth=1', '-b%s' % self.tag, '--recurse-submodules'],
-                                        progress=printDot)
+                                        progress=printDot,
+                                        branch=self.branch)
         print()
 
         # Prune then zip package
@@ -408,9 +428,9 @@ class FreertosRelease(BaseRelease):
     def autoRelease(self):
         info('Auto-releasing FreeRTOS V%s' % self.version)
 
-        self.updateFileHeaderVersions(['FreeRTOS Kernel V', 'FreeRTOS V'], 'FreeRTOS V%s' % self.version)
+        self.updateFileHeaderVersions(['FreeRTOS Kernel V', 'FreeRTOS V', 'FreeRTOS Kernel <DEVELOPMENT BRANCH>', 'FreeRTOS <DEVELOPMENT BRANCH>'], 'FreeRTOS V%s' % self.version)
         self.updateSubmodulePointers()
-        # When baselining off a non-HEAD commit, master is left unchanged by tagging a detached HEAD,
+        # When baselining off a non-HEAD commit, main is left unchanged by tagging a detached HEAD,
         # applying the autocommits, tagging, and pushing the new tag data to remote.
         # However in the detached HEAD state we don't have a branch to push to, so we skip
         if self.commit == 'HEAD':
@@ -444,7 +464,7 @@ def configure_argparser():
     parser.add_argument('--rollback-core-version',
                         default=None,
                         required=False,
-                        help='Reset "master" to state prior to autorelease of given core version')
+                        help='Reset "main" to state prior to autorelease of given core version')
 
     parser.add_argument('--core-repo-path',
                         type=str,
@@ -452,10 +472,21 @@ def configure_argparser():
                         required=False,
                         help='Instead of downloading from git, use existing local repos for autocommits')
 
+    parser.add_argument('--core-repo-branch',
+                        type=str,
+                        default='main',
+                        required=False,
+                        help='Branch of FreeRTOS hub repository to release.')
+
     parser.add_argument('--new-kernel-version',
                         default=None,
                         required=False,
-                        help='Reset "master" to just before the autorelease for the specified kernel version")')
+                        help='Reset "main" to just before the autorelease for the specified kernel version")')
+
+    parser.add_argument('--new-kernel-main-br-version',
+                        default='',
+                        required=False,
+                        help='Set the version in task.h on the kernel main branch to the specified value.')
 
     parser.add_argument('--kernel-commit',
                         default='HEAD',
@@ -466,13 +497,19 @@ def configure_argparser():
     parser.add_argument('--rollback-kernel-version',
                         default=None,
                         required=False,
-                        help='Reset "master" to state prior to autorelease of the given kernel version')
+                        help='Reset "main" to state prior to autorelease of the given kernel version')
 
     parser.add_argument('--kernel-repo-path',
                         type=str,
                         default=None,
                         required=False,
                         help='Instead of downloading from git, use existing local repos for autocommits')
+
+    parser.add_argument('--kernel-repo-branch',
+                        type=str,
+                        default='main',
+                        required=False,
+                        help='Branch of FreeRTOS Kernel repository to release.')
 
     parser.add_argument('--use-git-ssh',
                         default=False,
@@ -503,7 +540,8 @@ def main():
         info('Starting kernel release...')
         logIndentPush()
         rel_kernel = KernelRelease(mGit, args.new_kernel_version, args.kernel_commit, git_ssh=args.use_git_ssh,
-                                   git_org=args.git_org, repo_path=args.kernel_repo_path)
+                                   git_org=args.git_org, repo_path=args.kernel_repo_path, branch=args.kernel_repo_branch,
+                                   main_br_version=args.new_kernel_main_br_version)
         rel_kernel.autoRelease()
         logIndentPop()
 
@@ -511,7 +549,7 @@ def main():
         info('Starting core release...')
         logIndentPush()
         rel_freertos = FreertosRelease(mGit, args.new_core_version, args.core_commit, git_ssh=args.use_git_ssh,
-                                       git_org=args.git_org, repo_path=args.core_repo_path)
+                                       git_org=args.git_org, repo_path=args.core_repo_path, branch=args.core_repo_branch)
         rel_freertos.autoRelease()
         logIndentPop()
 
@@ -519,7 +557,7 @@ def main():
     if args.rollback_kernel_version:
         info('Starting kernel rollback...')
         rel_kernel = KernelRelease(mGit, args.rollback_kernel_version, args.kernel_commit, git_ssh=args.use_git_ssh,
-                                   git_org=args.git_org, repo_path=args.kernel_repo_path)
+                                   git_org=args.git_org, repo_path=args.kernel_repo_path, branch=args.kernel_repo_branch)
         logIndentPush()
         rel_kernel.restorePriorToRelease()
         logIndentPop()
@@ -528,7 +566,7 @@ def main():
         info('Starting core rollback...')
         logIndentPush()
         rel_freertos = FreertosRelease(mGit, args.rollback_core_version, args.core_commit, git_ssh=args.use_git_ssh,
-                                       git_org=args.git_org, repo_path=args.core_repo_path)
+                                       git_org=args.git_org, repo_path=args.core_repo_path, branch=args.core_repo_branch)
         rel_freertos.restorePriorToRelease()
         logIndentPop()
 
